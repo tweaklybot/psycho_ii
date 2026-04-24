@@ -1,6 +1,6 @@
 import logging
 import config
-import mistralai
+from mistralai import MistralClient
 from typing import TYPE_CHECKING, Any, cast
 
 # Static type checking import for linters like Pylance (no runtime import)
@@ -60,11 +60,11 @@ else:
 
 def get_embedding(text: str) -> list[float]:
     """Получает эмбеддинг текста через Mistral API."""
-    client = mistralai.Mistral(api_key=config.MISTRAL_API_KEY)
+    client = MistralClient(api_key=config.MISTRAL_API_KEY)
     try:
-        resp = client.embeddings.create(
+        resp = client.embeddings(
             model="mistral-embed",
-            inputs=[text]
+            input=[text]
         )
         # Попробуем безопасно извлечь эмбеддинг
         data = getattr(resp, "data", None) or (resp.get("data") if isinstance(resp, dict) else None)

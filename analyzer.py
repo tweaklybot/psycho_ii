@@ -2,7 +2,7 @@ import logging
 from memory import get_user_profile, save_user_profile
 import json
 import config
-import mistralai
+from mistralai import MistralClient
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +16,7 @@ async def update_profile_from_dialog(user_id: int):
     # Формируем текстовый диалог
     dialog_text = "\n".join([f"{m['role']}: {m['content']}" for m in session_msgs[-20:]])  # последние 20 сообщений
 
-    client = mistralai.Mistral(api_key=config.MISTRAL_API_KEY)
+    client = MistralClient(api_key=config.MISTRAL_API_KEY)
     instruction = (
         "Проанализируй следующий диалог между ИИ-психологом и пользователем. "
         "Извлеки новую информацию, которая важна для понимания пользователя: "
@@ -30,7 +30,7 @@ async def update_profile_from_dialog(user_id: int):
         "Никакого текста вне JSON."
     )
     try:
-        response = client.chat.complete(
+        response = client.chat(
             model=config.MISTRAL_MODEL,
             messages=[
                 {"role": "system", "content": instruction},

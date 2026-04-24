@@ -8,7 +8,7 @@ from vector_store import add_message_to_vector, search_similar_messages
 from prompts import build_system_prompt
 from analyzer import update_profile_from_dialog
 from config import ANALYZE_EVERY_N, MAX_HISTORY_MESSAGES, MISTRAL_API_KEY, MISTRAL_MODEL
-import mistralai
+from mistralai import MistralClient
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ async def handle_message(message: types.Message):
     history = profile.get("session_messages", [])[-MAX_HISTORY_MESSAGES:]
 
     # Вызов Mistral
-    client = mistralai.Mistral(api_key=MISTRAL_API_KEY)
+    client = MistralClient(api_key=MISTRAL_API_KEY)
     messages = [{"role": "system", "content": system_prompt}]
     for h_msg in history:
         messages.append(h_msg)
@@ -121,7 +121,7 @@ async def handle_message(message: types.Message):
     try:
         # suppress strict typing mismatch: the SDK types may expect specific Message objects
         from typing import Any, List, cast
-        response = client.chat.complete(
+        response = client.chat(
             model=MISTRAL_MODEL,
             messages=cast(List[Any], messages)
         )
