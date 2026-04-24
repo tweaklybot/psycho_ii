@@ -1,12 +1,14 @@
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from typing import Optional
 
 load_dotenv()
 
 class Config(BaseModel):
-    bot_token: str = Field(..., env="BOT_TOKEN")
-    mistral_api_key: str = Field(..., env="MISTRAL_API_KEY")
+    # Make secrets optional so the service can still boot the web process
+    bot_token: Optional[str] = Field(default=None, env="BOT_TOKEN")
+    mistral_api_key: Optional[str] = Field(default=None, env="MISTRAL_API_KEY")
     database_url: str = Field(default="psychobot.db", env="DATABASE_URL")  # путь к SQLite
     chroma_persist_dir: str = Field(default="./chroma_db", env="CHROMA_PERSIST_DIR")
     crisis_keywords: list[str] = [
