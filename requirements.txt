@@ -1,10 +1,6 @@
-aiogram>=3.5.0
-mistralai>=0.4.0
-aiosqlite>=0.19.0
-pillow>=9.0.0
-numpy>=1.26.0
-pydantic>=2.6.0
-python-dotenv>=1.0.0
-openai-whisper>=20230314
-# Optional: pin a lightweight whisper model if needed
-# whisperx or other alternatives can be used if openai-whisper is heavy on your host
+aiogram>=3.0.0
+mistralai
+chromadb
+aiosqlite
+pydantic
+python-dotenv

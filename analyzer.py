@@ -1,52 +1,78 @@
+import logging
+from memory import get_user_profile, save_user_profile
 import json
-from config import config
-from typing import List, Dict, Any
+import config
+import mistralai
 
-ANALYZER_PROMPT = """
-Ты — система извлечения информации из психологических сессий.
-Дан диалог между ИИ-психологом и пользователем.
-Извлеки новую важную информацию для JSON-профиля пользователя (частичное обновление).
-Опирайся на следующие поля:
-- current_state: строка, текущее психоэмоциональное состояние, настроение.
-- emotional_triggers: список строк, триггеры, вызывающие сильные эмоции.
-- coping_strategies: список строк, стратегии совладания, которые использует пользователь.
-- resources: список строк, сильные стороны, внешние и внутренние ресурсы.
-- therapy_goals: список строк, цели, которые обозначает пользователь (явно или неявно).
-- significant_events: список строк, важные события, упомянутые в разговоре.
-- other_notes: строка, любые дополнительные наблюдения.
+logger = logging.getLogger(__name__)
 
-Выведи ТОЛЬКО валидный JSON с обновлёнными полями (только те, что удалось извлечь). Не дополняй несуществующей информацией.
-Если никакой новой информации нет, верни пустой объект `{}`.
-Диалог:
-"""
+async def update_profile_from_dialog(user_id: int):
+    """Анализирует текущую сессию и обновляет профиль пользователя."""
+    profile = await get_user_profile(user_id)
+    session_msgs = profile.get("session_messages", [])
+    if not session_msgs:
+        return
 
-async def analyze_session(mistral_client: Any, messages: List[Dict]) -> dict:
-    """messages: список {"role": "user"/"assistant", "content": str} всей сессии."""
-    if not messages:
-        return {}
-    # Формируем текст диалога
-    dialog_text = ""
-    for m in messages:
-        role = "Пользователь" if m["role"] == "user" else "Психолог"
-        dialog_text += f"{role}: {m['content']}\n"
+    # Формируем текстовый диалог
+    dialog_text = "\n".join([f"{m['role']}: {m['content']}" for m in session_msgs[-20:]])  # последние 20 сообщений
 
-    full_prompt = ANALYZER_PROMPT + dialog_text
-
+    client = mistralai.Mistral(api_key=config.MISTRAL_API_KEY)
+    instruction = (
+        "Проанализируй следующий диалог между ИИ-психологом и пользователем. "
+        "Извлеки новую информацию, которая важна для понимания пользователя: "
+        "- изменилось ли настроение или появились новые жалобы (поле current_request), "
+        "- новые эмоциональные триггеры (emotional_triggers), "
+        "- новые стратегии совладания (coping_strategies) или ресурсы (resources), "
+        "- новые цели терапии (therapy_goals), "
+        "- какие фразы лучше избегать (avoid_phrases) и какой тон предпочтителен (preferred_tone). "
+        "Выведи ТОЛЬКО валидный JSON с полями, которые нужно обновить/добавить (частичный апдейт). "
+        "Пример: {\"current_request\": \"боится собеседований\", \"emotional_triggers\": [\"звонок начальника\"]}. "
+        "Никакого текста вне JSON."
+    )
     try:
-        response = await mistral_client.chat.complete_async(
-            model=config.mistral_chat_model,
-            messages=[{"role": "system", "content": full_prompt}],
-            temperature=0.1,
-            max_tokens=800
+        response = client.chat.complete(
+            model=config.MISTRAL_MODEL,
+            messages=[
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": dialog_text}
+            ],
+            response_format={"type": "json_object"}  # если модель поддерживает
         )
-        answer = response.choices[0].message.content.strip()
-        # Извлекаем JSON
-        # Иногда Mistral оборачивает JSON в ```json ... ```
-        if "```json" in answer:
-            answer = answer.split("```json")[1].split("```")[0].strip()
-        elif "```" in answer:
-            answer = answer.split("```")[1].split("```")[0].strip()
-        return json.loads(answer)
+
+        # Безопасно извлекаем текст из ответа — может быть None или иметь разную структуру
+        if response is None:
+            logger.error("Empty response from Mistral")
+            return
+
+        choices = getattr(response, "choices", None) or (response.get("choices") if isinstance(response, dict) else None)
+        if not choices:
+            logger.error("No choices in Mistral response")
+            return
+
+        first_choice = choices[0]
+        message_obj = getattr(first_choice, "message", None) or (first_choice.get("message") if isinstance(first_choice, dict) else None)
+        if not message_obj:
+            logger.error("No message object in first choice")
+            return
+
+        content = getattr(message_obj, "content", None) or (message_obj.get("content") if isinstance(message_obj, dict) else None)
+        if content is None:
+            logger.error("No content in message object")
+            return
+
+        # content может быть нестрокой — привести к строке перед парсингом
+        result_text = content if isinstance(content, str) else str(content)
+        updates = json.loads(result_text)
+
+        # Мерджим с профилем
+        for key, value in updates.items():
+            if isinstance(value, list) and key in profile and isinstance(profile[key], list):
+                profile[key] = list(set(profile[key] + value))
+            else:
+                profile[key] = value
+
+        await save_user_profile(user_id, profile)
+        logger.info(f"Profile updated for user {user_id}: {updates}")
+
     except Exception as e:
-        print(f"Анализ сессии провален: {e}")
-        return {}
+        logger.error(f"Profile update failed: {e}")

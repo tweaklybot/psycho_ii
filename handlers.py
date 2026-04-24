@@ -1,315 +1,174 @@
+import logging
 import asyncio
-import re
-import os
-import json
-import tempfile
-import subprocess
-import traceback
-from aiogram import Router, types, F
+from typing import Any, cast
+from aiogram import Router, types
 from aiogram.filters import Command
-from config import config
-from typing import Any
-from memory import Database
-from vector_store import VectorMemory
+from memory import get_user_profile, save_user_profile, delete_user_data
+from vector_store import add_message_to_vector, search_similar_messages
 from prompts import build_system_prompt
-from analyzer import analyze_session
-
-# Whisper for offline/local transcription (open-source). Requires `ffmpeg` available in PATH.
-# We avoid loading the model at import time to keep memory low on small hosts (Render).
-whisper = None
-_WHISPER_MODEL = None
+from analyzer import update_profile_from_dialog
+from config import ANALYZE_EVERY_N, MAX_HISTORY_MESSAGES, MISTRAL_API_KEY, MISTRAL_MODEL
+import mistralai
 
 router = Router()
-db: Database = None
-mistral: Any = None
-vector_memory: VectorMemory = None
+logger = logging.getLogger(__name__)
 
-# Инициализация внешних зависимостей (вызывается из bot.py)
-def setup_handlers(database: Database, client: Any, vec_mem: VectorMemory):
-    global db, mistral, vector_memory
-    db = database
-    mistral = client
-    vector_memory = vec_mem
-
-
-async def _process_user_text(message: types.Message, text: str):
-    """Core text processing: save message, embed, search, call Mistral, reply, update memory."""
-    user_id = message.from_user.id
-
-    # 1. Сохраняем сообщение пользователя в сессии
-    db.add_session_message(user_id, "user", text)
-
-    # 2. Получаем эмбеддинг текущего сообщения
-    try:
-        emb_resp = await mistral.embeddings.create_async(
-            model=config.mistral_embed_model,
-            input=[text]
-        )
-        query_embedding = emb_resp.data[0].embedding
-    except Exception as e:
-        await message.answer("Извините, произошла техническая ошибка. Попробуйте позже.")
-        print(f"Embedding error: {e}")
-        return
-
-    # 3. Поиск похожих фрагментов
-    similar = await vector_memory.search_similar(user_id, query_embedding, top_k=3)
-    history_str = ""
-    for user_msg, bot_resp in similar:
-        history_str += f"Пользователь: {user_msg}\nБот: {bot_resp}\n---\n"
-
-    # 4. Формируем системный промпт
-    profile_data = await db.get_profile(user_id)
-    current_state = profile_data["session_state"]
-    profile_json = profile_data["profile"]
-    system = build_system_prompt(profile_json, history_str, current_state)
-
-    # 5. Собираем историю последних 10 сообщений из сессии
-    recent_msgs = db.get_session_messages(user_id)[-10:]
-    mistral_messages = [{"role": "system", "content": system}]
-    for m in recent_msgs:
-        mistral_messages.append(m)
-
-    # 6. Запрос к Mistral
-    try:
-        response = await mistral.chat.complete_async(
-            model=config.mistral_chat_model,
-            messages=mistral_messages,
-            temperature=0.7,
-            max_tokens=1024
-        )
-        bot_answer = response.choices[0].message.content.strip()
-    except Exception as e:
-        await message.answer("Ошибка при генерации ответа. Попробуйте позже.")
-        print(f"Mistral chat error: {e}")
-        return
-
-    # 7. Извлечение этапа из ответа
-    new_state = current_state
-    match = re.search(r'\[ЭТАП:\s*(запрос|контекст|чувства|смыслы|ресурс)\]', bot_answer)
-    if match:
-        new_state = match.group(1).lower()
-        bot_answer = re.sub(r'\[ЭТАП:\s*(запрос|контекст|чувства|смыслы|ресурс)\]\s*', '', bot_answer).strip()
-
-    # 8. Отправка ответа пользователю
-    await message.answer(bot_answer)
-
-    # 9. Сохраняем ответ бота в сессии
-    db.add_session_message(user_id, "assistant", bot_answer)
-
-    # 10. Сохраняем в векторную память (сообщение пользователя + ответ)
-    await vector_memory.add_memory(user_id, text, bot_answer, query_embedding)
-
-    # 11. Обновляем этап в базе
-    await db.update_session_state(user_id, new_state)
-
-    # 12. Фоновый анализ при достижении N сообщений пользователя
-    user_msg_count = db.count_user_messages_in_session(user_id)
-    if user_msg_count > 0 and user_msg_count % config.summary_message_count == 0:
-        asyncio.create_task(background_analyze(user_id))
-
-
-def detect_crisis(text: str) -> bool:
-    text_lower = text.lower()
-    for kw in config.crisis_keywords:
-        if re.search(re.escape(kw), text_lower):
-            return True
-    return False
-
+# Кризисные стоп-слова
+CRISIS_KEYWORDS = ["суицид", "самоубийство", "селфхарм", "самоповрежд", "насилие", "хочу умереть", "убей", "покончить с собой"]
 CRISIS_RESPONSE = (
-    "🚨 Я слышу, что Вам сейчас очень тяжело, и это серьёзно. "
-    "Пожалуйста, не оставайтесь одни с этими мыслями.\n\n"
-    "Вы ценны, и Ваша жизнь имеет значение. Я рядом, чтобы выслушать. Расскажите, что происходит прямо сейчас."
+    "⚠️ Я слышу, что вам невыносимо тяжело. Я — всего лишь ИИ-помощник и не могу заменить профессиональную помощь. "
+    "Пожалуйста, прямо сейчас обратитесь к живым специалистам:\n"
+    "📞 Телефон доверия (Россия): 8-800-2000-122\n"
+    "📞 Кризисная линия: +7 (495) 989-50-50\n"
+    "Если вы находитесь в другой стране, поищите местные службы поддержки. Вы не один."
 )
-
-CONSENT_KEYBOARD = types.InlineKeyboardMarkup(inline_keyboard=[
-    [types.InlineKeyboardButton(text="✅ Согласен", callback_data="consent_yes")],
-    [types.InlineKeyboardButton(text="❌ Нет", callback_data="consent_no")]
-])
-
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    # Создать профиль при необходимости
-    profile_data = await db.get_profile(user_id)
-    if profile_data is None:
-        await db.create_user(user_id)
-        await message.answer(
-            "👋 Здравствуйте! Я — ИИ-психолог, созданный для поддержки и беседы.\n"
-            "Я не заменяю настоящего специалиста, но могу выслушать, помочь разобраться в чувствах и найти ресурсы.\n\n"
-            "⚠️ Для работы я буду хранить Ваш профиль и историю диалогов. Все данные остаются локально и не передаются третьим лицам, "
-            "кроме анонимных запросов к языковой модели Mistral AI.\n\n"
-            "Пожалуйста, дайте согласие на хранение и обработку данных:",
-            reply_markup=CONSENT_KEYBOARD
-        )
-    else:
-        if profile_data["consent"]:
-            await message.answer(
-                "С возвращением! Я помню Вас. Мы можем продолжить нашу беседу. Если хотите начать заново, используйте /new_session."
-            )
-        else:
-            await message.answer(
-                "Вы ещё не дали согласие на обработку данных. Пожалуйста, подтвердите его, чтобы я мог работать.",
-                reply_markup=CONSENT_KEYBOARD
-            )
-
-
-@router.callback_query(F.data == "consent_yes")
-async def consent_yes(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await db.update_consent(user_id, True)
-    await callback.message.edit_text("✅ Согласие получено! Мы можем начинать. Просто расскажите, что Вас беспокоит или с чем Вы пришли.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "consent_no")
-async def consent_no(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    # Оставляем consent=False, можем удалить данные по желанию
-    await callback.message.edit_text(
-        "Вы отказались от использования бота. Ваши данные не будут обрабатываться. "
-        "Если передумаете, просто нажмите /start и дайте согласие."
+    await message.answer(
+        "Привет! Я — ИИ-психолог (экспериментальный). Я не настоящий специалист, не ставлю диагнозы и не лечу. "
+        "Всё, что вы расскажете, останется между нами (в рамках системы). "
+        "Вы согласны, что ваши данные будут обрабатываться для работы бота?",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree")],
+            [types.InlineKeyboardButton(text="❌ Нет", callback_data="disagree")]
+        ])
     )
+
+@router.callback_query(lambda c: c.data == "agree")
+async def agree_handler(callback: types.CallbackQuery):
+    # Сохраняем согласие
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+    profile = await get_user_profile(user_id)
+    profile["agreed"] = True
+    await save_user_profile(user_id, profile)
+    await callback.message.answer("Спасибо! Теперь вы можете начать беседу. Расскажите, что вас беспокоит.")
     await callback.answer()
 
+@router.callback_query(lambda c: c.data == "disagree")
+async def disagree_handler(callback: types.CallbackQuery):
+    if callback.message:
+        await callback.message.answer("Без согласия на обработку данных я не могу продолжить. Если передумаете — напишите /start.")
+    await callback.answer()
 
 @router.message(Command("new_session"))
-async def new_session(message: types.Message):
-    user_id = message.from_user.id
-    profile = await db.get_profile(user_id)
-    if profile and profile["consent"]:
-        db.clear_session(user_id)
-        await db.update_session_state(user_id, "запрос")
-        await message.answer("🔄 Начинаем новую сессию. Я готов слушать. Что Вас привело сегодня?")
-    else:
-        await message.answer("Сначала дайте согласие через /start.")
-
+async def cmd_new_session(message: types.Message):
+    if not message.from_user:
+        return
+    profile = await get_user_profile(message.from_user.id)
+    profile["session_state"] = "gathering_request"
+    profile["session_messages"] = []  # сброс текущей сессии
+    await save_user_profile(message.from_user.id, profile)
+    await message.answer("Сессия сброшена. Можете начать новый разговор.")
 
 @router.message(Command("profile"))
-async def show_profile(message: types.Message):
-    user_id = message.from_user.id
-    data = await db.get_profile(user_id)
-    if not data or not data["consent"]:
-        await message.answer("Профиль недоступен. Дайте согласие через /start.")
+async def cmd_profile(message: types.Message):
+    if not message.from_user:
         return
-    profile = data["profile"]
-    state = data["session_state"]
-    text = f"📋 **Ваш текущий профиль**\nТекущий этап: {state}\n\n"
-    if profile:
-        text += json.dumps(profile, ensure_ascii=False, indent=2)
-    else:
-        text += "Пока пусто."
-    await message.answer(text[:4000])  # лимит Telegram
-
+    profile = await get_user_profile(message.from_user.id)
+    summary = f"**Ваш профиль:**\n"
+    summary += f"Текущий запрос: {profile.get('current_request', 'не указан')}\n"
+    summary += f"Триггеры: {', '.join(profile.get('emotional_triggers', [])) or 'нет'}\n"
+    summary += f"Ресурсы: {', '.join(profile.get('resources', [])) or 'нет'}\n"
+    await message.answer(summary)
 
 @router.message(Command("delete_data"))
-async def delete_data(message: types.Message):
-    user_id = message.from_user.id
-    await db.delete_user(user_id)
-    await vector_memory.delete_user_memories(user_id)
-    await message.answer("🗑 Все Ваши данные удалены. Вы можете начать заново с /start.")
-
-
-@router.message(Command("summarize"))
-async def force_summarize(message: types.Message):
-    user_id = message.from_user.id
-    profile_data = await db.get_profile(user_id)
-    if not profile_data or not profile_data["consent"]:
-        await message.answer("Нет активного согласия.")
+async def cmd_delete_data(message: types.Message):
+    if not message.from_user:
         return
-    session_msgs = db.get_session_messages(user_id)
-    if not session_msgs:
-        await message.answer("Сессия пуста, нечего анализировать.")
-        return
-    await message.answer("⏳ Анализирую текущую сессию...")
-    # Запускаем анализ
-    update = await analyze_session(mistral, session_msgs)
-    if update:
-        await db.update_profile(user_id, update)
-        await message.answer("✅ Профиль обновлён.")
-    else:
-        await message.answer("ℹ️ Новой информации не найдено.")
+    await delete_user_data(message.from_user.id)
+    await message.answer("Все ваши данные удалены. Чтобы начать заново, нажмите /start.")
 
-
-@router.message(F.text)
+@router.message()
 async def handle_message(message: types.Message):
-    user_id = message.from_user.id
-    # Проверка consent
-    profile_data = await db.get_profile(user_id)
-    if profile_data is None or not profile_data["consent"]:
-        await message.answer("Пожалуйста, сначала дайте согласие на обработку данных через /start.",
-                             reply_markup=CONSENT_KEYBOARD)
+    if not message.from_user:
         return
 
-    # Проверка кризисных слов
-    if detect_crisis(message.text):
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+
+    # Проверка на кризисные слова (примитивный, но работает)
+    if any(word in text.lower() for word in CRISIS_KEYWORDS):
         await message.answer(CRISIS_RESPONSE)
         return
 
-    await _process_user_text(message, message.text)
-
-
-@router.message(F.voice)
-async def handle_voice(message: types.Message):
-    """Обработка голосовых сообщений: скачиваем, конвертируем, транскрибируем, обрабатываем как текст."""
-    user_id = message.from_user.id
-    profile_data = await db.get_profile(user_id)
-    if profile_data is None or not profile_data["consent"]:
-        await message.answer("Пожалуйста, сначала дайте согласие на обработку данных через /start.",
-                             reply_markup=CONSENT_KEYBOARD)
+    # Загружаем профиль
+    profile = await get_user_profile(user_id)
+    if not profile.get("agreed"):
+        await message.answer("Пожалуйста, сначала дайте согласие через /start.")
         return
 
-    await message.answer("📥 Получил голосовое сообщение, расшифровываю...")
+    # Векторный поиск похожих прошлых сообщений
+    similar_docs = await search_similar_messages(user_id, text, top_k=3)
 
-    ogg_path = None
-    wav_path = None
+    # Формируем системный промпт
+    system_prompt = build_system_prompt(profile, similar_docs)
+
+    # История текущей сессии (последние MAX_HISTORY_MESSAGES)
+    history = profile.get("session_messages", [])[-MAX_HISTORY_MESSAGES:]
+
+    # Вызов Mistral
+    client = mistralai.Mistral(api_key=MISTRAL_API_KEY)
+    messages = [{"role": "system", "content": system_prompt}]
+    for h_msg in history:
+        messages.append(h_msg)
+    messages.append({"role": "user", "content": text})
+
     try:
-        # Скачиваем файл во временный ogg
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tf:
-            ogg_path = tf.name
-        await message.voice.download(destination_file=ogg_path)
+        # suppress strict typing mismatch: the SDK types may expect specific Message objects
+        from typing import Any, List, cast
+        response = client.chat.complete(
+            model=MISTRAL_MODEL,
+            messages=cast(List[Any], messages)
+        )
 
-        # Конвертируем в wav (whisper ожидает wav/pcm или ffmpeg-совместимый вход)
-        wav_path = ogg_path + ".wav"
-        subprocess.run(["ffmpeg", "-y", "-i", ogg_path, wav_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Безопасно извлекаем текст ответа
+        reply = None
+        if response is not None:
+            choices = getattr(response, "choices", None) or (response.get("choices") if isinstance(response, dict) else None)
+            if choices:
+                first_choice = choices[0]
+                message_obj = getattr(first_choice, "message", None) or (first_choice.get("message") if isinstance(first_choice, dict) else None)
+                if message_obj:
+                    content = getattr(message_obj, "content", None) or (message_obj.get("content") if isinstance(message_obj, dict) else None)
+                    if content is not None:
+                        reply = content if isinstance(content, str) else str(content)
 
-        # Транскрипция (lazy load модели Whisper в отдельном потоке)
-        global whisper, _WHISPER_MODEL
-        if _WHISPER_MODEL is None:
-            try:
-                if whisper is None:
-                    whisper = __import__("whisper")
-                # Загрузка модели в поток, чтобы не блокировать цикл событий
-                _WHISPER_MODEL = await asyncio.to_thread(whisper.load_model, "tiny")
-            except Exception as _e:
-                print("Warning: failed to load Whisper model:", _e)
-                await message.answer("Модель для транскрипции недоступна на сервере. Установите `openai-whisper` и убедитесь, что `ffmpeg` доступен.")
-                return
-        result = await asyncio.to_thread(_WHISPER_MODEL.transcribe, wav_path)
-        text = result.get("text", "").strip()
-        if not text:
-            await message.answer("Не удалось распознать речь. Попробуйте записать ещё раз чуть громче и без фоновых шумов.")
-            return
-
-        await message.answer(f"📝 Расшифровка: {text}")
-        await _process_user_text(message, text)
+        if not reply:
+            raise RuntimeError("Empty reply from model")
     except Exception as e:
-        await message.answer("Ошибка при обработке голосового сообщения.")
-        print("Voice processing error:", e, traceback.format_exc())
-    finally:
-        for p in (ogg_path, wav_path):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+        logger.error(f"Mistral API error: {e}")
+        reply = "Извините, произошла техническая ошибка. Попробуйте позже."
 
+    await message.answer(reply)
 
-async def background_analyze(user_id: int):
-    """Фоновый анализ сессии и обновление профиля."""
-    session_msgs = db.get_session_messages(user_id)
-    if not session_msgs:
-        return
-    update = await analyze_session(mistral, session_msgs)
-    if update:
-        await db.update_profile(user_id, update)
+    # Сохраняем сообщение и ответ в сессию
+    profile.setdefault("session_messages", [])
+    profile["session_messages"].append({"role": "user", "content": text})
+    profile["session_messages"].append({"role": "assistant", "content": reply})
+
+    # Добавляем в векторную память (только сообщение пользователя)
+    await add_message_to_vector(user_id, text, role="user")
+
+    # Обновляем этап воронки (очень примитивно: после 2-3 сообщений переключаем)
+    # Здесь можно было бы спросить у LLM, но пока так
+    state = profile.get("session_state", "gathering_request")
+    if state == "gathering_request" and len(profile["session_messages"]) >= 2:
+        state = "context"
+    elif state == "context" and len(profile["session_messages"]) >= 4:
+        state = "feelings"
+    elif state == "feelings" and len(profile["session_messages"]) >= 6:
+        state = "meanings"
+    elif state == "meanings" and len(profile["session_messages"]) >= 8:
+        state = "resource"
+    profile["session_state"] = state
+    await save_user_profile(user_id, profile)
+
+    # Запускаем обновление профиля каждые ANALYZE_EVERY_N сообщений
+    if len(profile.get("session_messages", [])) % (2 * ANALYZE_EVERY_N) == 0:
+        if callable(update_profile_from_dialog):
+            asyncio.create_task(update_profile_from_dialog(user_id))
