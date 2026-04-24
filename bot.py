@@ -3,7 +3,8 @@ import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from config import BOT_TOKEN, LOG_LEVEL, PORT
+from aiogram.types import Update
+from config import BOT_TOKEN, LOG_LEVEL, PORT, WEBHOOK_URL
 from handlers import router
 
 logging.basicConfig(level=LOG_LEVEL)
@@ -21,11 +22,21 @@ async def main():
     async def health_check(request):
         return web.Response(text="OK")
 
-    app.router.add_get("/", health_check)
+    async def webhook_handler(request):
+        data = await request.json()
+        update = Update.model_validate(data)
+        await dp.feed_update(bot, update)
+        return web.Response(text="OK")
 
-    # Запускаем polling бота в фоне
-    loop = asyncio.get_event_loop()
-    loop.create_task(dp.start_polling(bot))
+    app.router.add_get("/", health_check)
+    app.router.add_post("/webhook", webhook_handler)
+
+    # Устанавливаем вебхук
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
+    else:
+        logger.warning("WEBHOOK_URL not set, webhook not configured")
 
     # Стартуем веб-сервер на порту из Render
     runner = web.AppRunner(app)
