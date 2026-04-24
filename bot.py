@@ -4,7 +4,6 @@ import signal
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from config import config
-from mistralai.client import MistralClient
 from memory import Database
 from vector_store import VectorMemory
 import handlers

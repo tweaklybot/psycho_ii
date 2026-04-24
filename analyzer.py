@@ -1,7 +1,6 @@
 import json
-from mistralai.client import MistralClient
 from config import config
-from typing import List, Dict
+from typing import List, Dict, Any
 
 ANALYZER_PROMPT = """
 Ты — система извлечения информации из психологических сессий.
@@ -21,7 +20,7 @@ ANALYZER_PROMPT = """
 Диалог:
 """
 
-async def analyze_session(mistral_client: MistralClient, messages: List[Dict]) -> dict:
+async def analyze_session(mistral_client: Any, messages: List[Dict]) -> dict:
     """messages: список {"role": "user"/"assistant", "content": str} всей сессии."""
     if not messages:
         return {}

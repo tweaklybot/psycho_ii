@@ -8,7 +8,7 @@ import traceback
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from config import config
-from mistralai.client import MistralClient
+from typing import Any
 from memory import Database
 from vector_store import VectorMemory
 from prompts import build_system_prompt
@@ -21,11 +21,11 @@ _WHISPER_MODEL = None
 
 router = Router()
 db: Database = None
-mistral: MistralClient = None
+mistral: Any = None
 vector_memory: VectorMemory = None
 
 # Инициализация внешних зависимостей (вызывается из bot.py)
-def setup_handlers(database: Database, client: MistralClient, vec_mem: VectorMemory):
+def setup_handlers(database: Database, client: Any, vec_mem: VectorMemory):
     global db, mistral, vector_memory
     db = database
     mistral = client
